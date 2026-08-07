@@ -230,16 +230,22 @@ def score_listings(raw_items, model_pattern, proxy_password):
         parsed.append(f)
 
     if not parsed:
+        print(f"[DEBUG] Ningún anuncio pasó el filtro de título/modelo. "
+              f"Títulos crudos recibidos ({len(raw_items)}):")
+        for item in raw_items:
+            print(f"    - {item.get('title')!r}  (precio: {item.get('price')})")
         return []
 
     # Consultamos reputación real solo de los candidatos que ya pasaron los
     # filtros anteriores (para no gastar peticiones de más), y descartamos
     # directamente a quien no llegue a 4.5★ / 200 reseñas.
+    print(f"[DEBUG] {len(parsed)} candidatos pasaron el filtro de título/modelo, consultando reputación...")
     qualified = []
     for p in parsed:
         rating, num_reviews = get_seller_reputation(p["user_id"], proxy_password)
         p["seller_rating"] = rating
         p["seller_num_reviews"] = num_reviews
+        print(f"    - {p['title']!r}: rating={rating}, reseñas={num_reviews}")
         time.sleep(0.3)  # evitar martillear la API de Wallapop
 
         if rating is None or rating < MIN_SELLER_RATING or num_reviews < MIN_SELLER_REVIEWS:
