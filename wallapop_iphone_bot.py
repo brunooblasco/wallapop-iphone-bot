@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Bot diario de búsqueda de iPhone 14 / iPhone 15 en Wallapop usando Playwright.
+Bot diario de búsqueda de iPhone 14 / iPhone 15 en Wallapop.
+
+v3: en vez de scrapear Wallapop directamente (bloqueado por su sistema
+anti-bot para IPs de datacenter como las de GitHub Actions), usamos el
+actor de Apify "data_alchemist/wallapop-search", que ya resuelve ese
+bloqueo con su propia infraestructura de proxies. Coste: ~$5 por cada
+1000 páginas buscadas -> con 2 búsquedas/día son céntimos al mes, dentro
+del crédito gratuito de Apify ($5/mes, sin tarjeta).
 """
 
 import os
-import sys
 import json
 import time
 import smtplib
 import statistics
+import requests
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-
-from playwright.sync_api import sync_playwright
 
 # --------------------------------------------------------------------------
 # CONFIGURACIÓN
@@ -26,181 +31,116 @@ SEARCH_TERMS = {
 EXCLUDE_WORDS = ["funda", "case", "cargador", "cable", "protector",
                  "pantalla rota", "para piezas", "solo pantalla", "carcasa"]
 
-MAX_RESULTS_PER_SEARCH = 50
 TOP_N_PER_MODEL = 3
-LATITUDE = 40.4168   # Madrid
-LONGITUDE = -3.7038
-SEARCH_DISTANCE_M = 100000
+MAX_RESULTS_PER_SEARCH = 40
+LOCATION = "40.4165, -3.70256"  # Madrid
+
+APIFY_ACTOR = "data_alchemist~wallapop-search"
+APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
 DEBUG = os.environ.get("WALLAPOP_DEBUG", "0") == "1"
 
-REAL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+# --------------------------------------------------------------------------
+# BÚSQUEDA VÍA APIFY
+# --------------------------------------------------------------------------
+
+def search_wallapop(keyword, api_token):
+    """Llama al actor de Apify que scrapea Wallapop y devuelve sus items."""
+    payload = {
+        "keywords": keyword,
+        "minPrice": 0,
+        "maxPrice": 0,  # 0 = sin máximo. OJO: el default del actor es 200€,
+                        # lo que descartaría casi todos los iPhone 14/15 reales.
+        "location": LOCATION,
+        "orderBy": "newest",
+        "maxResults": MAX_RESULTS_PER_SEARCH,
+    }
+    try:
+        resp = requests.post(
+            APIFY_URL,
+            params={"token": api_token},
+            json=payload,
+            timeout=180,  # el actor tarda en arrancar y scrapear, damos margen
+        )
+        resp.raise_for_status()
+        items = resp.json()
+        if DEBUG and items:
+            print(f"[DEBUG] Ejemplo de item crudo para '{keyword}':")
+            print(json.dumps(items[0], indent=2, ensure_ascii=False)[:2000])
+        return items
+    except Exception as e:
+        print(f"[ERROR] Fallo llamando a Apify para '{keyword}': {e}")
+        return []
+
 
 # --------------------------------------------------------------------------
-# BÚSQUEDA EN WALLAPOP CON NAVEGADOR VIRTUAL
+# NORMALIZACIÓN DE CAMPOS
 # --------------------------------------------------------------------------
 #
-# CLAVE DEL FIX: no navegamos directamente a la URL de la API (eso da 403,
-# porque Wallapop detecta que no es una petición hecha por su propio
-# JavaScript desde una página real). En vez de eso, cargamos la página de
-# búsqueda real de es.wallapop.com e INTERCEPTAMOS la llamada de red que la
-# propia web hace internamente a su API. Esa llamada sí lleva las cookies de
-# sesión, cabeceras y token que su sistema anti-bot espera.
+# No conocemos con total certeza los nombres exactos de campo que devuelve
+# este actor de terceros, así que probamos varias claves habituales para
+# cada dato. Si el email sale con precios/títulos vacíos, activa
+# WALLAPOP_DEBUG=1 para ver el JSON crudo real y ajustar las listas de abajo.
 
-def accept_cookies_if_present(page):
-    """
-    Muchos sitios (Wallapop incluido) no lanzan sus llamadas a la API hasta
-    que el banner de consentimiento de cookies se resuelve. Sin esto, un
-    navegador headless se queda esperando una petición que nunca llega.
-    Probamos varios textos/selectores típicos, sin fallar si no aparece.
-    """
-    selectors = [
-        "text=Aceptar todo",
-        "text=Aceptar todas",
-        "text=Aceptar",
-        "text=Accept all",
-        "text=Accept",
-        "#onetrust-accept-btn-handler",
-        "button[data-testid='cookie-accept-all']",
-        "button[id*='accept']",
-    ]
-    for sel in selectors:
-        try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=2000):
-                btn.click(timeout=2000)
-                page.wait_for_timeout(500)
-                return True
-        except Exception:
-            continue
-    return False
+def first_present(d, keys, default=None):
+    for k in keys:
+        if isinstance(d, dict) and d.get(k) not in (None, ""):
+            return d.get(k)
+    return default
 
-
-def search_wallapop(context, keyword):
-    """
-    Carga la página de búsqueda real, acepta cookies si hace falta, y captura
-    la respuesta JSON que la propia web pide a su API. Si no encontramos la
-    llamada esperada, volcamos diagnóstico (URLs vistas + captura de pantalla)
-    para poder ver qué está pasando de verdad en vez de adivinar.
-    """
-    items = []
-    page = context.new_page()
-    seen_responses = []
-
-    def record_response(response):
-        seen_responses.append((response.status, response.url))
-
-    page.on("response", record_response)
-
-    search_url = (
-        "https://es.wallapop.com/app/search?"
-        f"keywords={keyword.replace(' ', '+')}"
-        f"&latitude={LATITUDE}&longitude={LONGITUDE}"
-        "&filters_source=search_box&order_by=newest"
-    )
-
-    try:
-        page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-        accept_cookies_if_present(page)
-
-        # Damos margen a que la SPA dispare su llamada tras cargar/aceptar cookies
-        target_response = None
-        try:
-            target_response = page.wait_for_event(
-                "response",
-                lambda r: "wallapop.com" in r.url and "search" in r.url.lower(),
-                timeout=15000,
-            )
-        except Exception:
-            pass
-
-        if target_response and target_response.ok:
-            data = target_response.json()
-            items = data.get("search_objects", []) or data.get("objects", [])
-        else:
-            print(f"[ERROR] No se capturó respuesta de búsqueda válida para '{keyword}'.")
-            print(f"[DEBUG] {len(seen_responses)} peticiones vistas. Últimas 15:")
-            for status, url in seen_responses[-15:]:
-                print(f"    {status}  {url}")
-            if DEBUG:
-                safe_name = keyword.replace(' ', '_')
-                page.screenshot(path=f"debug_{safe_name}.png", full_page=True)
-                print(f"[DEBUG] Captura guardada en debug_{safe_name}.png")
-    except Exception as e:
-        print(f"[ERROR] Fallo buscando '{keyword}': {e}")
-    finally:
-        page.close()
-
-    return items[:MAX_RESULTS_PER_SEARCH]
-
-
-def get_seller_reputation(context, user_id):
-    """
-    Usa el cliente HTTP del propio contexto del navegador (comparte cookies
-    de sesión ya obtenidas) en vez de abrir un navegador nuevo por vendedor.
-    Mucho más rápido y mucho menos probable que dispare el anti-bot.
-    """
-    if not user_id:
-        return None, 0
-    url = f"https://api.wallapop.com/api/v3/users/{user_id}/reviews"
-    try:
-        resp = context.request.get(url, timeout=10000)
-        if resp.ok:
-            d = resp.json()
-            rating = d.get("rating_average") or d.get("average_rating")
-            total = d.get("total") or d.get("total_reviews") or len(d.get("reviews", []))
-            return rating, total
-    except Exception:
-        pass
-    return None, 0
-
-# --------------------------------------------------------------------------
-# NORMALIZACIÓN DE CAMPOS Y PUNTUACIÓN
-# --------------------------------------------------------------------------
 
 def extract_fields(item):
-    title = item.get("title") or item.get("content", {}).get("title", "")
-    description = item.get("description") or item.get("content", {}).get("description", "")
+    title = first_present(item, ["title", "name", "productTitle"], "(sin título)")
+    description = first_present(item, ["description", "productDescription"], "")
 
-    price_block = item.get("price") or item.get("content", {}).get("price", {})
-    if isinstance(price_block, dict):
-        price = price_block.get("amount") or price_block.get("cash", {}).get("amount")
+    price = first_present(item, ["price", "salePrice", "amount"])
+    if isinstance(price, dict):
+        price = first_present(price, ["amount", "value", "cash"])
+
+    link = first_present(item, ["url", "link", "itemUrl", "webSlug"])
+    if link and not str(link).startswith("http"):
+        link = f"https://es.wallapop.com/item/{link}"
+
+    seller = first_present(item, ["seller", "user", "sellerInfo"], {})
+    if isinstance(seller, dict):
+        seller_name = first_present(seller, ["name", "microName", "username"], "Vendedor")
+        seller_rating = first_present(seller, ["rating", "ratingAverage", "score"])
+        seller_num_ratings = first_present(seller, ["numReviews", "totalReviews", "reviewCount"], 0)
+        seller_id = first_present(seller, ["id", "userId"])
     else:
-        price = price_block
+        seller_name, seller_rating, seller_num_ratings, seller_id = "Vendedor", None, 0, None
 
-    user_block = item.get("user") or item.get("content", {}).get("user", {})
-    user_id = user_block.get("id")
-    seller_name = user_block.get("micro_name") or user_block.get("name") or "Vendedor"
-
-    slug = item.get("web_slug") or item.get("content", {}).get("web_slug")
-    item_id = item.get("id") or item.get("content", {}).get("id")
-    link = f"https://es.wallapop.com/item/{slug}" if slug else (
-        f"https://es.wallapop.com/item/{item_id}" if item_id else None
-    )
-
-    location = item.get("location") or item.get("content", {}).get("location", {})
-    city = location.get("city", "") if isinstance(location, dict) else ""
+    city = first_present(item, ["city", "location"], "")
+    if isinstance(city, dict):
+        city = first_present(city, ["city", "name"], "")
 
     return {
-        "title": title or "(sin título)",
-        "description": description or "",
-        "price": price,
-        "user_id": user_id,
+        "title": str(title),
+        "description": str(description or ""),
+        "price": float(price) if price not in (None, "") else None,
+        "seller_id": seller_id,
         "seller_name": seller_name,
+        "seller_rating": float(seller_rating) if seller_rating not in (None, "") else None,
+        "seller_num_ratings": int(seller_num_ratings) if seller_num_ratings else 0,
         "link": link,
         "city": city,
     }
+
 
 def is_excluded(title, description):
     text = f"{title} {description}".lower()
     return any(word in text for word in EXCLUDE_WORDS)
 
-def score_listings(context, raw_items):
+
+# --------------------------------------------------------------------------
+# PUNTUACIÓN
+# --------------------------------------------------------------------------
+
+def score_listings(raw_items):
     parsed = []
     for item in raw_items:
         f = extract_fields(item)
-        if f["price"] is None:
+        if f["price"] is None or f["price"] <= 0:
             continue
         if is_excluded(f["title"], f["description"]):
             continue
@@ -213,34 +153,32 @@ def score_listings(context, raw_items):
     median_price = statistics.median(prices)
 
     for p in parsed:
-        rating, num_ratings = get_seller_reputation(context, p["user_id"])
-        time.sleep(0.15)  # evitar martillear la API
-        p["seller_rating"] = rating
-        p["seller_num_ratings"] = num_ratings
+        price_component = min(1.5, median_price / p["price"])
 
-        price_component = min(1.5, median_price / p["price"]) if p["price"] > 0 else 0
-
-        if rating:
-            trust_component = (rating / 5) * min(1.0, (num_ratings ** 0.5) / 5)
+        if p["seller_rating"]:
+            trust_component = (p["seller_rating"] / 5) * min(1.0, (p["seller_num_ratings"] ** 0.5) / 5)
         else:
-            trust_component = 0.15
+            trust_component = 0.15  # sin datos de vendedor: no descartar, pero penalizar
 
         p["score"] = round(0.6 * price_component + 0.4 * trust_component, 3)
 
     parsed.sort(key=lambda x: x["score"], reverse=True)
     return parsed
 
+
 def top_n_diverse(parsed, n):
     seen_sellers = set()
     result = []
     for p in parsed:
-        if p["user_id"] in seen_sellers and p["user_id"] is not None:
+        key = p["seller_id"] or p["seller_name"]
+        if key in seen_sellers:
             continue
         result.append(p)
-        seen_sellers.add(p["user_id"])
+        seen_sellers.add(key)
         if len(result) == n:
             break
     return result
+
 
 # --------------------------------------------------------------------------
 # EMAIL
@@ -259,16 +197,18 @@ def build_email_html(results_by_model):
                 f"{l['seller_rating']:.1f}★ ({l['seller_num_ratings']} valoraciones)"
                 if l["seller_rating"] else "sin valoraciones"
             )
+            link_html = f"<a href='{l['link']}'>Ver anuncio</a>" if l["link"] else "(sin enlace)"
             parts.append(
                 "<li style='margin-bottom:12px;'>"
                 f"<b>{l['title']}</b><br>"
-                f"💶 {l['price']} € &nbsp;|&nbsp; 📍 {l['city'] or 'ubicación no indicada'}<br>"
+                f"💶 {l['price']:.0f} € &nbsp;|&nbsp; 📍 {l['city'] or 'ubicación no indicada'}<br>"
                 f"👤 {l['seller_name']} — {rating_txt}<br>"
-                f"<a href='{l['link']}'>Ver anuncio</a>"
+                f"{link_html}"
                 "</li>"
             )
         parts.append("</ol>")
     return "".join(parts)
+
 
 def send_email(html_body):
     sender = os.environ["GMAIL_USER"]
@@ -288,41 +228,24 @@ def send_email(html_body):
 
     print("Email enviado correctamente.")
 
+
 # --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
 
 def main():
+    api_token = os.environ["APIFY_TOKEN"]
     results_by_model = {}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=REAL_UA,
-            locale="es-ES",
-            viewport={"width": 1280, "height": 800},
-        )
-
-        # Visitamos primero la home para que el navegador recoja cookies de
-        # sesión reales antes de ir a buscar (igual que haría una persona).
-        try:
-            home = context.new_page()
-            home.goto("https://es.wallapop.com", timeout=30000, wait_until="domcontentloaded")
-            home.wait_for_timeout(1500)
-            home.close()
-        except Exception as e:
-            print(f"[WARN] No se pudo cargar la home de Wallapop: {e}")
-
-        for model_label, keyword in SEARCH_TERMS.items():
-            print(f"Buscando: {keyword}...")
-            raw = search_wallapop(context, keyword)
-            print(f"  -> {len(raw)} anuncios crudos")
-            scored = score_listings(context, raw)
-            top = top_n_diverse(scored, TOP_N_PER_MODEL)
-            results_by_model[model_label] = top
-            print(f"  -> {len(top)} seleccionados tras filtrar/puntuar")
-
-        browser.close()
+    for model_label, keyword in SEARCH_TERMS.items():
+        print(f"Buscando: {keyword}...")
+        raw = search_wallapop(keyword, api_token)
+        print(f"  -> {len(raw)} anuncios crudos de Apify")
+        scored = score_listings(raw)
+        top = top_n_diverse(scored, TOP_N_PER_MODEL)
+        results_by_model[model_label] = top
+        print(f"  -> {len(top)} seleccionados tras filtrar/puntuar")
+        time.sleep(1)
 
     html = build_email_html(results_by_model)
 
@@ -333,6 +256,7 @@ def main():
         return
 
     send_email(html)
+
 
 if __name__ == "__main__":
     main()
