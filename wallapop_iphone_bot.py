@@ -43,9 +43,13 @@ LONGITUDE = -3.7038
 SEARCH_DISTANCE_M = 100000  # 100km a la redonda
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "DeviceOS": "0",
     "X-DeviceOS": "0",
-    "Accept": "application/json",
+    "Origin": "https://es.wallapop.com",
+    "Referer": "https://es.wallapop.com/",
 }
 
 DEBUG = os.environ.get("WALLAPOP_DEBUG", "0") == "1"
