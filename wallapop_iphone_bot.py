@@ -57,6 +57,12 @@ TOP_N_PER_MODEL = 3
 MAX_RESULTS_PER_SEARCH = 40
 LOCATION = "40.4165, -3.70256"  # Madrid
 
+# Umbral solo para la búsqueda ordenada por precio: por debajo de esto en
+# Wallapop casi todo son fundas, cables y protectores, no iPhones reales.
+# No afecta a qué anuncios acaban en el email (eso lo decide el filtro por
+# título), solo evita gastar el cupo de 40 resultados en accesorios.
+CHEAP_SEARCH_MIN_PRICE = 100
+
 APIFY_ACTOR = "data_alchemist~wallapop-search"
 APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
@@ -66,15 +72,15 @@ DEBUG = os.environ.get("WALLAPOP_DEBUG", "0") == "1"
 # BÚSQUEDA VÍA APIFY
 # --------------------------------------------------------------------------
 
-def search_wallapop(keyword, api_token):
+def search_wallapop(keyword, api_token, order_by, min_price=0):
     """Llama al actor de Apify que scrapea Wallapop y devuelve sus items."""
     payload = {
         "keywords": keyword,
-        "minPrice": 0,
+        "minPrice": min_price,
         "maxPrice": 0,  # 0 = sin máximo. El default del actor es 200€, lo
                         # que descartaría casi todos los iPhone 14/15 reales.
         "location": LOCATION,
-        "orderBy": "newest",
+        "orderBy": order_by,
         "maxResults": MAX_RESULTS_PER_SEARCH,
     }
     try:
@@ -87,8 +93,34 @@ def search_wallapop(keyword, api_token):
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"[ERROR] Fallo llamando a Apify para '{keyword}': {e}")
+        print(f"[ERROR] Fallo llamando a Apify para '{keyword}' (orden: {order_by}): {e}")
         return []
+
+
+def search_wallapop_combined(keyword, api_token):
+    """
+    Combina dos vistas de Wallapop para no perdernos ni lo recién publicado
+    ni los chollos más antiguos: si solo pidiéramos 'newest', un anuncio
+    barato de hace unos días podría quedar fuera de los primeros N resultados
+    y nunca llegar a puntuarse.
+
+    La vista por precio lleva un mínimo (CHEAP_SEARCH_MIN_PRICE) solo para no
+    malgastar sus 40 huecos en fundas y accesorios de pocos euros; la vista
+    por 'newest' no tiene mínimo, así que un iPhone genuino recién publicado
+    y barato se sigue viendo igualmente.
+    """
+    newest = search_wallapop(keyword, api_token, "newest")
+    cheapest = search_wallapop(keyword, api_token, "price_low_to_high", min_price=CHEAP_SEARCH_MIN_PRICE)
+
+    seen_ids = set()
+    combined = []
+    for item in newest + cheapest:
+        item_id = item.get("id")
+        if item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        combined.append(item)
+    return combined
 
 
 # --------------------------------------------------------------------------
@@ -245,8 +277,8 @@ def main():
 
     for model_label, keyword in SEARCH_TERMS.items():
         print(f"Buscando: {keyword}...")
-        raw = search_wallapop(keyword, api_token)
-        print(f"  -> {len(raw)} anuncios crudos de Apify")
+        raw = search_wallapop_combined(keyword, api_token)
+        print(f"  -> {len(raw)} anuncios crudos de Apify (newest + price_low_to_high, sin duplicados)")
         scored = score_listings(raw, MODEL_PATTERNS[model_label])
         top = top_n_diverse(scored, TOP_N_PER_MODEL)
         results_by_model[model_label] = top
