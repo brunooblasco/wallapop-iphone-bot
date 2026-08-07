@@ -31,6 +31,13 @@ SEARCH_TERMS = {
 EXCLUDE_WORDS = ["funda", "case", "cargador", "cable", "protector",
                  "pantalla rota", "para piezas", "solo pantalla", "carcasa"]
 
+EXCLUDE_WORDS_TITLE = [
+    "pantalla", "repuesto", "reparaci", "cambio de pantalla", "cambio pantalla",
+    "despiece", "para piezas", "no enciende", "avería", "averiado",
+    "bateria", "batería", "flex", "conector de carga", "tapa trasera",
+    "carcasa", "solo pantalla", "cristal", "táctil", "reparar",
+]
+
 TOP_N_PER_MODEL = 3
 MAX_RESULTS_PER_SEARCH = 40
 LOCATION = "40.4165, -3.70256"  # Madrid
@@ -128,8 +135,15 @@ def extract_fields(item):
 
 
 def is_excluded(title, description):
+    title_lower = title.lower()
     text = f"{title} {description}".lower()
-    return any(word in text for word in EXCLUDE_WORDS)
+    # Título: lista estricta (si el propio título suena a repuesto/reparación, fuera)
+    if any(word in title_lower for word in EXCLUDE_WORDS_TITLE):
+        return True
+    # Descripción+título: lista más suave, complementaria
+    if any(word in text for word in EXCLUDE_WORDS):
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -241,6 +255,9 @@ def main():
         print(f"Buscando: {keyword}...")
         raw = search_wallapop(keyword, api_token)
         print(f"  -> {len(raw)} anuncios crudos de Apify")
+        if raw:
+            print(f"[DEBUG] Claves del primer item crudo: {list(raw[0].keys())}")
+            print(f"[DEBUG] Item crudo completo:\n{json.dumps(raw[0], indent=2, ensure_ascii=False)[:2500]}")
         scored = score_listings(raw)
         top = top_n_diverse(scored, TOP_N_PER_MODEL)
         results_by_model[model_label] = top
