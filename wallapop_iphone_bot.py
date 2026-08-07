@@ -1,15 +1,6 @@
 #!/usr/bin/env python3
 """
-Bot diario de búsqueda de iPhone 14 / iPhone 15 en Wallapop.
-
-Busca anuncios, valora la fiabilidad del vendedor (rating + nº de ventas/valoraciones)
-combinada con el precio frente a la media del mercado, y envía un email con las
-3 mejores opciones de cada modelo.
-
-IMPORTANTE: Wallapop no publica una API oficial. Este script usa los mismos
-endpoints internos que usa la web (api.wallapop.com). Si Wallapop cambia su
-API, esto puede romperse. Ejecuta con WALLAPOP_DEBUG=1 para imprimir el JSON
-crudo de un anuncio y así poder ajustar las rutas de los campos si hace falta.
+Bot diario de búsqueda de iPhone 14 / iPhone 15 en Wallapop usando Playwright.
 """
 
 import os
@@ -21,7 +12,7 @@ import statistics
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import requests
+from playwright.sync_api import sync_playwright
 
 # --------------------------------------------------------------------------
 # CONFIGURACIÓN
@@ -32,91 +23,85 @@ SEARCH_TERMS = {
     "iPhone 15": "iphone 15",
 }
 
-# Excluye accesorios / fundas / piezas sueltas que a veces cuelan en la búsqueda
 EXCLUDE_WORDS = ["funda", "case", "cargador", "cable", "protector",
                  "pantalla rota", "para piezas", "solo pantalla", "carcasa"]
 
 MAX_RESULTS_PER_SEARCH = 50
 TOP_N_PER_MODEL = 3
-LATITUDE = 40.4168   # Madrid, ajusta si quieres centrar la búsqueda en otro sitio
+LATITUDE = 40.4168   # Madrid
 LONGITUDE = -3.7038
-SEARCH_DISTANCE_M = 100000  # 100km a la redonda
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "DeviceOS": "0",
-    "X-DeviceOS": "0",
-    "Origin": "https://es.wallapop.com",
-    "Referer": "https://es.wallapop.com/",
-}
+SEARCH_DISTANCE_M = 100000
 
 DEBUG = os.environ.get("WALLAPOP_DEBUG", "0") == "1"
 
-
-def debug_print(*args):
-    if DEBUG:
-        print("[DEBUG]", *args)
-
-
 # --------------------------------------------------------------------------
-# BÚSQUEDA EN WALLAPOP
+# BÚSQUEDA EN WALLAPOP CON NAVEGADOR VIRTUAL
 # --------------------------------------------------------------------------
 
 def search_wallapop(keyword):
-    """Llama al endpoint de búsqueda de Wallapop y devuelve la lista de anuncios."""
-    url = "https://api.wallapop.com/api/v3/general/search"
-    params = {
-        "keywords": keyword,
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "distance": SEARCH_DISTANCE_M,
-        "order_by": "newest",
-        "filters_source": "quick_filters",
-    }
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print(f"[ERROR] Fallo buscando '{keyword}': {e}")
-        return []
-
-    items = data.get("search_objects", []) or data.get("objects", [])
-    if DEBUG and items:
-        debug_print(f"Ejemplo de item crudo para '{keyword}':")
-        debug_print(json.dumps(items[0], indent=2, ensure_ascii=False)[:2000])
+    """Lanza un Chromium headless para obtener datos como un usuario real."""
+    wallapop_url = f"https://api.wallapop.com/api/v3/general/search?keywords={keyword}&latitude={LATITUDE}&longitude={LONGITUDE}&distance={SEARCH_DISTANCE_M}&order_by=newest"
+    
+    items = []
+    with sync_playwright() as p:
+        # Lanzamos un navegador Chromium real
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            locale="es-ES"
+        )
+        page = context.new_page()
+        
+        try:
+            # Primero visitamos la home para aceptar galletas/tokens
+            page.goto("https://es.wallapop.com", timeout=30000, wait_until="domcontentloaded")
+            time.sleep(2)
+            
+            # Consultamos la API desde la sesión activa del navegador
+            response = page.goto(wallapop_url, timeout=30000)
+            if response and response.ok:
+                data = response.json()
+                items = data.get("search_objects", []) or data.get("objects", [])
+            else:
+                print(f"[ERROR] Estado de la respuesta: {response.status if response else 'Sin respuesta'}")
+        except Exception as e:
+            print(f"[ERROR] Fallo en la navegación para '{keyword}': {e}")
+        finally:
+            browser.close()
 
     return items[:MAX_RESULTS_PER_SEARCH]
 
 
 def get_seller_reputation(user_id):
-    """
-    Intenta obtener rating medio y nº de valoraciones del vendedor.
-    Devuelve (rating_0_5, num_valoraciones). Si falla, devuelve (None, 0).
-    """
     if not user_id:
         return None, 0
     url = f"https://api.wallapop.com/api/v3/users/{user_id}/reviews"
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        if r.status_code != 200:
-            return None, 0
-        d = r.json()
-        rating = d.get("rating_average") or d.get("average_rating")
-        total = d.get("total") or d.get("total_reviews") or len(d.get("reviews", []))
-        return rating, total
-    except Exception:
-        return None, 0
-
+    rating, total = None, 0
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        try:
+            response = page.goto(url, timeout=15000)
+            if response and response.ok:
+                d = response.json()
+                rating = d.get("rating_average") or d.get("average_rating")
+                total = d.get("total") or d.get("total_reviews") or len(d.get("reviews", []))
+        except Exception:
+            pass
+        finally:
+            browser.close()
+            
+    return rating, total
 
 # --------------------------------------------------------------------------
-# NORMALIZACIÓN DE CAMPOS (defensivo, porque el JSON de Wallapop es inestable)
+# NORMALIZACIÓN DE CAMPOS Y PUNTUACIÓN
 # --------------------------------------------------------------------------
 
 def extract_fields(item):
-    """Extrae de forma defensiva los campos que nos interesan de un anuncio."""
     title = item.get("title") or item.get("content", {}).get("title", "")
     description = item.get("description") or item.get("content", {}).get("description", "")
 
@@ -149,22 +134,11 @@ def extract_fields(item):
         "city": city,
     }
 
-
 def is_excluded(title, description):
     text = f"{title} {description}".lower()
     return any(word in text for word in EXCLUDE_WORDS)
 
-
-# --------------------------------------------------------------------------
-# PUNTUACIÓN
-# --------------------------------------------------------------------------
-
 def score_listings(raw_items):
-    """
-    Convierte anuncios crudos en listados enriquecidos con score.
-    Score = combinación de (precio relativo a la mediana, más barato = mejor)
-            y (fiabilidad del vendedor: rating * log(nº valoraciones + 1)).
-    """
     parsed = []
     for item in raw_items:
         f = extract_fields(item)
@@ -184,25 +158,20 @@ def score_listings(raw_items):
         rating, num_ratings = get_seller_reputation(p["user_id"])
         p["seller_rating"] = rating
         p["seller_num_ratings"] = num_ratings
-        time.sleep(0.15)  # evitar martillear la API
 
-        # Componente precio: cuanto más barato respecto a la mediana, mejor (tope en 1.5)
         price_component = min(1.5, median_price / p["price"]) if p["price"] > 0 else 0
 
-        # Componente fiabilidad: valoración media (0-5) ponderada por volumen de ventas
         if rating:
             trust_component = (rating / 5) * min(1.0, (num_ratings ** 0.5) / 5)
         else:
-            trust_component = 0.15  # vendedor sin datos: no descartar, pero penalizar
+            trust_component = 0.15
 
         p["score"] = round(0.6 * price_component + 0.4 * trust_component, 3)
 
     parsed.sort(key=lambda x: x["score"], reverse=True)
     return parsed
 
-
 def top_n_diverse(parsed, n):
-    """Coge el top N evitando devolver 3 anuncios del mismo vendedor."""
     seen_sellers = set()
     result = []
     for p in parsed:
@@ -213,7 +182,6 @@ def top_n_diverse(parsed, n):
         if len(result) == n:
             break
     return result
-
 
 # --------------------------------------------------------------------------
 # EMAIL
@@ -243,7 +211,6 @@ def build_email_html(results_by_model):
         parts.append("</ol>")
     return "".join(parts)
 
-
 def send_email(html_body):
     sender = os.environ["GMAIL_USER"]
     password = os.environ["GMAIL_APP_PASSWORD"]
@@ -261,7 +228,6 @@ def send_email(html_body):
         server.sendmail(sender, receiver, msg.as_string())
 
     print("Email enviado correctamente.")
-
 
 # --------------------------------------------------------------------------
 # MAIN
@@ -288,7 +254,6 @@ def main():
         return
 
     send_email(html)
-
 
 if __name__ == "__main__":
     main()
