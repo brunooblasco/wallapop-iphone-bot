@@ -27,18 +27,30 @@ from email.mime.text import MIMEText
 # CONFIGURACIÓN
 # --------------------------------------------------------------------------
 
+import re
+
 SEARCH_TERMS = {
     "iPhone 14": "iphone 14",
     "iPhone 15": "iphone 15",
 }
 
+# El buscador de Wallapop hace coincidencias laxas (p.ej. "iphone 14" también
+# devuelve un "Xiaomi Redmi Note 14 Pro" o accesorios Apple sin relación).
+# Exigimos que el título contenga de verdad "iphone" + el número de modelo,
+# permitiendo variantes de la misma familia (Plus/Pro/Pro Max/mini) pero
+# excluyendo modelos distintos (12, 13, 16...).
+MODEL_PATTERNS = {
+    "iPhone 14": re.compile(r"iphone\s*14\b", re.IGNORECASE),
+    "iPhone 15": re.compile(r"iphone\s*15\b", re.IGNORECASE),
+}
+
 # Solo filtramos por título: si el propio título es un servicio de
-# reparación/repuesto, no es un iPhone a la venta, sea cual sea su precio.
+# reparación/repuesto o un accesorio, no es un iPhone a la venta.
 EXCLUDE_WORDS_TITLE = [
     "pantalla", "repuesto", "reparaci", "reparar", "despiece", "para piezas",
     "no enciende", "avería", "averiado", "bateria", "batería", "flex",
     "conector de carga", "tapa trasera", "carcasa", "cristal", "táctil",
-    "funda", "case", "cargador", "cable", "protector",
+    "funda", "case", "cargador", "cable", "protector", "magsafe", "cartera",
 ]
 
 TOP_N_PER_MODEL = 3
@@ -116,17 +128,23 @@ def is_excluded(title):
     return any(word in title_lower for word in EXCLUDE_WORDS_TITLE)
 
 
+def matches_model(title, model_pattern):
+    return bool(model_pattern.search(title))
+
+
 # --------------------------------------------------------------------------
 # PUNTUACIÓN
 # --------------------------------------------------------------------------
 
-def score_listings(raw_items):
+def score_listings(raw_items, model_pattern):
     parsed = []
     for item in raw_items:
         f = extract_fields(item)
         if f["price"] is None or f["price"] <= 0:
             continue
         if is_excluded(f["title"]):
+            continue
+        if not matches_model(f["title"], model_pattern):
             continue
         parsed.append(f)
 
@@ -229,7 +247,7 @@ def main():
         print(f"Buscando: {keyword}...")
         raw = search_wallapop(keyword, api_token)
         print(f"  -> {len(raw)} anuncios crudos de Apify")
-        scored = score_listings(raw)
+        scored = score_listings(raw, MODEL_PATTERNS[model_label])
         top = top_n_diverse(scored, TOP_N_PER_MODEL)
         results_by_model[model_label] = top
         print(f"  -> {len(top)} seleccionados tras filtrar/puntuar")
