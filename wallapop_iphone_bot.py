@@ -2,12 +2,16 @@
 """
 Bot diario de búsqueda de iPhone 14 / iPhone 15 en Wallapop.
 
-v3: en vez de scrapear Wallapop directamente (bloqueado por su sistema
-anti-bot para IPs de datacenter como las de GitHub Actions), usamos el
-actor de Apify "data_alchemist/wallapop-search", que ya resuelve ese
-bloqueo con su propia infraestructura de proxies. Coste: ~$5 por cada
-1000 páginas buscadas -> con 2 búsquedas/día son céntimos al mes, dentro
-del crédito gratuito de Apify ($5/mes, sin tarjeta).
+v4: usa el actor de Apify "data_alchemist/wallapop-search" (resuelve el
+bloqueo anti-bot de Wallapop con su propia infraestructura de proxies).
+Campos confirmados con datos reales del actor -- ya no se adivina nada:
+title, description, price.amount, location.city, web_slug/item_url,
+is_top_profile (insignia de vendedor destacado de Wallapop),
+has_warranty (el anuncio incluye garantía), is_refurbished.
+
+Este actor NO expone rating/nº de reseñas del vendedor -- no existe ese
+dato en su output. Por eso la "fiabilidad" se mide con las dos señales
+que sí trae Wallapop de forma nativa: is_top_profile y has_warranty.
 """
 
 import os
@@ -28,14 +32,13 @@ SEARCH_TERMS = {
     "iPhone 15": "iphone 15",
 }
 
-EXCLUDE_WORDS = ["funda", "case", "cargador", "cable", "protector",
-                 "pantalla rota", "para piezas", "solo pantalla", "carcasa"]
-
+# Solo filtramos por título: si el propio título es un servicio de
+# reparación/repuesto, no es un iPhone a la venta, sea cual sea su precio.
 EXCLUDE_WORDS_TITLE = [
-    "pantalla", "repuesto", "reparaci", "cambio de pantalla", "cambio pantalla",
-    "despiece", "para piezas", "no enciende", "avería", "averiado",
-    "bateria", "batería", "flex", "conector de carga", "tapa trasera",
-    "carcasa", "solo pantalla", "cristal", "táctil", "reparar",
+    "pantalla", "repuesto", "reparaci", "reparar", "despiece", "para piezas",
+    "no enciende", "avería", "averiado", "bateria", "batería", "flex",
+    "conector de carga", "tapa trasera", "carcasa", "cristal", "táctil",
+    "funda", "case", "cargador", "cable", "protector",
 ]
 
 TOP_N_PER_MODEL = 3
@@ -56,8 +59,8 @@ def search_wallapop(keyword, api_token):
     payload = {
         "keywords": keyword,
         "minPrice": 0,
-        "maxPrice": 0,  # 0 = sin máximo. OJO: el default del actor es 200€,
-                        # lo que descartaría casi todos los iPhone 14/15 reales.
+        "maxPrice": 0,  # 0 = sin máximo. El default del actor es 200€, lo
+                        # que descartaría casi todos los iPhone 14/15 reales.
         "location": LOCATION,
         "orderBy": "newest",
         "maxResults": MAX_RESULTS_PER_SEARCH,
@@ -67,83 +70,50 @@ def search_wallapop(keyword, api_token):
             APIFY_URL,
             params={"token": api_token},
             json=payload,
-            timeout=180,  # el actor tarda en arrancar y scrapear, damos margen
+            timeout=180,
         )
         resp.raise_for_status()
-        items = resp.json()
-        if DEBUG and items:
-            print(f"[DEBUG] Ejemplo de item crudo para '{keyword}':")
-            print(json.dumps(items[0], indent=2, ensure_ascii=False)[:2000])
-        return items
+        return resp.json()
     except Exception as e:
         print(f"[ERROR] Fallo llamando a Apify para '{keyword}': {e}")
         return []
 
 
 # --------------------------------------------------------------------------
-# NORMALIZACIÓN DE CAMPOS
+# NORMALIZACIÓN DE CAMPOS (schema real confirmado)
 # --------------------------------------------------------------------------
-#
-# No conocemos con total certeza los nombres exactos de campo que devuelve
-# este actor de terceros, así que probamos varias claves habituales para
-# cada dato. Si el email sale con precios/títulos vacíos, activa
-# WALLAPOP_DEBUG=1 para ver el JSON crudo real y ajustar las listas de abajo.
-
-def first_present(d, keys, default=None):
-    for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, ""):
-            return d.get(k)
-    return default
-
 
 def extract_fields(item):
-    title = first_present(item, ["title", "name", "productTitle"], "(sin título)")
-    description = first_present(item, ["description", "productDescription"], "")
+    title = item.get("title") or "(sin título)"
+    description = item.get("description") or ""
 
-    price = first_present(item, ["price", "salePrice", "amount"])
-    if isinstance(price, dict):
-        price = first_present(price, ["amount", "value", "cash"])
+    price_block = item.get("price") or {}
+    price = price_block.get("amount") if isinstance(price_block, dict) else price_block
 
-    link = first_present(item, ["url", "link", "itemUrl", "webSlug"])
-    if link and not str(link).startswith("http"):
-        link = f"https://es.wallapop.com/item/{link}"
+    location = item.get("location") or {}
+    city = location.get("city", "") if isinstance(location, dict) else ""
 
-    seller = first_present(item, ["seller", "user", "sellerInfo"], {})
-    if isinstance(seller, dict):
-        seller_name = first_present(seller, ["name", "microName", "username"], "Vendedor")
-        seller_rating = first_present(seller, ["rating", "ratingAverage", "score"])
-        seller_num_ratings = first_present(seller, ["numReviews", "totalReviews", "reviewCount"], 0)
-        seller_id = first_present(seller, ["id", "userId"])
-    else:
-        seller_name, seller_rating, seller_num_ratings, seller_id = "Vendedor", None, 0, None
-
-    city = first_present(item, ["city", "location"], "")
-    if isinstance(city, dict):
-        city = first_present(city, ["city", "name"], "")
+    link = item.get("item_url")
+    if not link:
+        slug = item.get("web_slug")
+        link = f"https://es.wallapop.com/item/{slug}" if slug else None
 
     return {
         "title": str(title),
-        "description": str(description or ""),
+        "description": str(description),
         "price": float(price) if price not in (None, "") else None,
-        "seller_id": seller_id,
-        "seller_name": seller_name,
-        "seller_rating": float(seller_rating) if seller_rating not in (None, "") else None,
-        "seller_num_ratings": int(seller_num_ratings) if seller_num_ratings else 0,
+        "user_id": item.get("user_id"),
         "link": link,
         "city": city,
+        "is_top_profile": bool(item.get("is_top_profile")),
+        "has_warranty": bool(item.get("has_warranty")),
+        "is_refurbished": bool(item.get("is_refurbished")),
     }
 
 
-def is_excluded(title, description):
+def is_excluded(title):
     title_lower = title.lower()
-    text = f"{title} {description}".lower()
-    # Título: lista estricta (si el propio título suena a repuesto/reparación, fuera)
-    if any(word in title_lower for word in EXCLUDE_WORDS_TITLE):
-        return True
-    # Descripción+título: lista más suave, complementaria
-    if any(word in text for word in EXCLUDE_WORDS):
-        return True
-    return False
+    return any(word in title_lower for word in EXCLUDE_WORDS_TITLE)
 
 
 # --------------------------------------------------------------------------
@@ -156,7 +126,7 @@ def score_listings(raw_items):
         f = extract_fields(item)
         if f["price"] is None or f["price"] <= 0:
             continue
-        if is_excluded(f["title"], f["description"]):
+        if is_excluded(f["title"]):
             continue
         parsed.append(f)
 
@@ -167,12 +137,12 @@ def score_listings(raw_items):
     median_price = statistics.median(prices)
 
     for p in parsed:
+        # Precio: más barato que la mediana del día = mejor (tope en 1.5x)
         price_component = min(1.5, median_price / p["price"])
 
-        if p["seller_rating"]:
-            trust_component = (p["seller_rating"] / 5) * min(1.0, (p["seller_num_ratings"] ** 0.5) / 5)
-        else:
-            trust_component = 0.15  # sin datos de vendedor: no descartar, pero penalizar
+        # Fiabilidad: insignia de vendedor destacado de Wallapop + garantía
+        trust_component = (0.65 if p["is_top_profile"] else 0.0) + \
+                           (0.35 if p["has_warranty"] else 0.0)
 
         p["score"] = round(0.6 * price_component + 0.4 * trust_component, 3)
 
@@ -184,11 +154,10 @@ def top_n_diverse(parsed, n):
     seen_sellers = set()
     result = []
     for p in parsed:
-        key = p["seller_id"] or p["seller_name"]
-        if key in seen_sellers:
+        if p["user_id"] in seen_sellers and p["user_id"] is not None:
             continue
         result.append(p)
-        seen_sellers.add(key)
+        seen_sellers.add(p["user_id"])
         if len(result) == n:
             break
     return result
@@ -207,16 +176,21 @@ def build_email_html(results_by_model):
             continue
         parts.append("<ol>")
         for l in listings:
-            rating_txt = (
-                f"{l['seller_rating']:.1f}★ ({l['seller_num_ratings']} valoraciones)"
-                if l["seller_rating"] else "sin valoraciones"
-            )
+            badges = []
+            if l["is_top_profile"]:
+                badges.append("⭐ Vendedor destacado")
+            if l["has_warranty"]:
+                badges.append("🛡️ Con garantía")
+            if l["is_refurbished"]:
+                badges.append("♻️ Reacondicionado")
+            badges_txt = " · ".join(badges) if badges else "Sin insignias de Wallapop"
+
             link_html = f"<a href='{l['link']}'>Ver anuncio</a>" if l["link"] else "(sin enlace)"
             parts.append(
                 "<li style='margin-bottom:12px;'>"
                 f"<b>{l['title']}</b><br>"
                 f"💶 {l['price']:.0f} € &nbsp;|&nbsp; 📍 {l['city'] or 'ubicación no indicada'}<br>"
-                f"👤 {l['seller_name']} — {rating_txt}<br>"
+                f"{badges_txt}<br>"
                 f"{link_html}"
                 "</li>"
             )
@@ -255,9 +229,6 @@ def main():
         print(f"Buscando: {keyword}...")
         raw = search_wallapop(keyword, api_token)
         print(f"  -> {len(raw)} anuncios crudos de Apify")
-        if raw:
-            print(f"[DEBUG] Claves del primer item crudo: {list(raw[0].keys())}")
-            print(f"[DEBUG] Item crudo completo:\n{json.dumps(raw[0], indent=2, ensure_ascii=False)[:2500]}")
         scored = score_listings(raw)
         top = top_n_diverse(scored, TOP_N_PER_MODEL)
         results_by_model[model_label] = top
