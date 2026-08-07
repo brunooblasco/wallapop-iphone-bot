@@ -27,4 +27,5 @@ jobs:
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           APIFY_PROXY_PASSWORD: ${{ secrets.APIFY_PROXY_PASSWORD }}
+          WALLAPOP_DEBUG: "1"
         run: python wallapop_iphone_bot.py
