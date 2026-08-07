@@ -66,6 +66,15 @@ CHEAP_SEARCH_MIN_PRICE = 100
 APIFY_ACTOR = "data_alchemist~wallapop-search"
 APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
+# Criterio de fiabilidad que pediste: solo vendedores con >4.5 de media Y
+# más de 200 reseñas. El actor de búsqueda no trae este dato, así que lo
+# consultamos aparte directamente a Wallapop, a través del proxy
+# residencial de Apify (las IPs de datacenter, incluidas las de GitHub
+# Actions, están bloqueadas por su sistema anti-bot).
+MIN_SELLER_RATING = 4.5
+MIN_SELLER_REVIEWS = 200
+APIFY_PROXY_URL_TEMPLATE = "http://groups-RESIDENTIAL:{password}@proxy.apify.com:8000"
+
 DEBUG = os.environ.get("WALLAPOP_DEBUG", "0") == "1"
 
 # --------------------------------------------------------------------------
@@ -165,10 +174,50 @@ def matches_model(title, model_pattern):
 
 
 # --------------------------------------------------------------------------
+# REPUTACIÓN DEL VENDEDOR (vía proxy residencial de Apify)
+# --------------------------------------------------------------------------
+
+def get_seller_reputation(user_id, proxy_password):
+    """
+    Consulta el rating y nº de reseñas de un vendedor directamente en
+    Wallapop, a través del proxy residencial de Apify para no toparnos con
+    su bloqueo anti-bot. Devuelve (rating, num_reviews) o (None, 0) si falla.
+
+    OJO: no tenemos confirmación de que este endpoint/campos sigan siendo
+    exactamente así en 2026 -- si el email excluye a todo el mundo, activa
+    WALLAPOP_DEBUG=1 y revisa el volcado del primer vendedor consultado.
+    """
+    if not user_id or not proxy_password:
+        return None, 0
+
+    proxy_url = APIFY_PROXY_URL_TEMPLATE.format(password=proxy_password)
+    proxies = {"http": proxy_url, "https": proxy_url}
+    url = f"https://api.wallapop.com/api/v3/users/{user_id}/reviews"
+
+    try:
+        resp = requests.get(url, proxies=proxies, timeout=20)
+        if not resp.ok:
+            print(f"[WARN] Reputación de {user_id}: HTTP {resp.status_code}")
+            return None, 0
+        d = resp.json()
+        if DEBUG:
+            print(f"[DEBUG] Reputación cruda de {user_id}:")
+            print(json.dumps(d, indent=2, ensure_ascii=False)[:1000])
+
+        rating = d.get("rating_average") or d.get("average_rating") or d.get("rating")
+        total = (d.get("total") or d.get("total_reviews") or d.get("total_ratings")
+                 or len(d.get("reviews", []) if isinstance(d.get("reviews"), list) else []))
+        return (float(rating) if rating else None), int(total or 0)
+    except Exception as e:
+        print(f"[WARN] Fallo consultando reputación de {user_id}: {e}")
+        return None, 0
+
+
+# --------------------------------------------------------------------------
 # PUNTUACIÓN
 # --------------------------------------------------------------------------
 
-def score_listings(raw_items, model_pattern):
+def score_listings(raw_items, model_pattern, proxy_password):
     parsed = []
     for item in raw_items:
         f = extract_fields(item)
@@ -183,21 +232,38 @@ def score_listings(raw_items, model_pattern):
     if not parsed:
         return []
 
-    prices = [p["price"] for p in parsed]
+    # Consultamos reputación real solo de los candidatos que ya pasaron los
+    # filtros anteriores (para no gastar peticiones de más), y descartamos
+    # directamente a quien no llegue a 4.5★ / 200 reseñas.
+    qualified = []
+    for p in parsed:
+        rating, num_reviews = get_seller_reputation(p["user_id"], proxy_password)
+        p["seller_rating"] = rating
+        p["seller_num_reviews"] = num_reviews
+        time.sleep(0.3)  # evitar martillear la API de Wallapop
+
+        if rating is None or rating < MIN_SELLER_RATING or num_reviews < MIN_SELLER_REVIEWS:
+            continue
+        qualified.append(p)
+
+    if not qualified:
+        return []
+
+    prices = [p["price"] for p in qualified]
     median_price = statistics.median(prices)
 
-    for p in parsed:
+    for p in qualified:
         # Precio: más barato que la mediana del día = mejor (tope en 1.5x)
         price_component = min(1.5, median_price / p["price"])
 
-        # Fiabilidad: insignia de vendedor destacado de Wallapop + garantía
-        trust_component = (0.65 if p["is_top_profile"] else 0.0) + \
-                           (0.35 if p["has_warranty"] else 0.0)
+        # Ya filtramos por >=4.5★ y >=200 reseñas; usamos el rating real
+        # como desempate fino en vez de una insignia binaria.
+        trust_component = p["seller_rating"] / 5
 
         p["score"] = round(0.6 * price_component + 0.4 * trust_component, 3)
 
-    parsed.sort(key=lambda x: x["score"], reverse=True)
-    return parsed
+    qualified.sort(key=lambda x: x["score"], reverse=True)
+    return qualified
 
 
 def top_n_diverse(parsed, n):
@@ -234,13 +300,14 @@ def build_email_html(results_by_model):
             if l["is_refurbished"]:
                 badges.append("♻️ Reacondicionado")
             badges_txt = " · ".join(badges) if badges else "Sin insignias de Wallapop"
+            rating_txt = f"{l['seller_rating']:.1f}★ ({l['seller_num_reviews']} reseñas)"
 
             link_html = f"<a href='{l['link']}'>Ver anuncio</a>" if l["link"] else "(sin enlace)"
             parts.append(
                 "<li style='margin-bottom:12px;'>"
                 f"<b>{l['title']}</b><br>"
                 f"💶 {l['price']:.0f} € &nbsp;|&nbsp; 📍 {l['city'] or 'ubicación no indicada'}<br>"
-                f"{badges_txt}<br>"
+                f"👤 {rating_txt} &nbsp;|&nbsp; {badges_txt}<br>"
                 f"{link_html}"
                 "</li>"
             )
@@ -273,16 +340,17 @@ def send_email(html_body):
 
 def main():
     api_token = os.environ["APIFY_TOKEN"]
+    proxy_password = os.environ["APIFY_PROXY_PASSWORD"]
     results_by_model = {}
 
     for model_label, keyword in SEARCH_TERMS.items():
         print(f"Buscando: {keyword}...")
-        raw = search_wallapop_combined(keyword, api_token)
-        print(f"  -> {len(raw)} anuncios crudos de Apify (newest + price_low_to_high, sin duplicados)")
-        scored = score_listings(raw, MODEL_PATTERNS[model_label])
+        raw = search_wallapop(keyword, api_token, "newest")
+        print(f"  -> {len(raw)} anuncios crudos de Apify")
+        scored = score_listings(raw, MODEL_PATTERNS[model_label], proxy_password)
         top = top_n_diverse(scored, TOP_N_PER_MODEL)
         results_by_model[model_label] = top
-        print(f"  -> {len(top)} seleccionados tras filtrar/puntuar")
+        print(f"  -> {len(top)} seleccionados tras filtrar/puntuar (con >{MIN_SELLER_RATING}★ y >{MIN_SELLER_REVIEWS} reseñas)")
         time.sleep(1)
 
     html = build_email_html(results_by_model)
