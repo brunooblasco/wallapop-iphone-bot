@@ -2,7 +2,6 @@ name: Bot diario iPhone Wallapop
 
 on:
   schedule:
-    # 08:00 UTC = 09:00 o 10:00 hora de Madrid según horario de verano/invierno
     - cron: "0 8 * * *"
   workflow_dispatch: {}
 
@@ -19,23 +18,12 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: |
-          pip install -r requirements.txt
-          playwright install chromium --with-deps
+        run: pip install -r requirements.txt
 
       - name: Ejecutar bot
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-          WALLAPOP_DEBUG: "1"
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
         run: python wallapop_iphone_bot.py
-        continue-on-error: true
-
-      - name: Subir capturas de depuración
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: debug_*.png
-          if-no-files-found: ignore
