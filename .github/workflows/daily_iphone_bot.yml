@@ -2,6 +2,7 @@ name: Bot diario iPhone Wallapop
 
 on:
   schedule:
+    # 08:00 UTC = 09:00 o 10:00 hora de Madrid según horario de verano/invierno
     - cron: "0 8 * * *"
   workflow_dispatch: {}
 
@@ -18,7 +19,9 @@ jobs:
           python-version: "3.11"
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
 
       - name: Ejecutar bot
         env:
