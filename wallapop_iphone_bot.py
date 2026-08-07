@@ -48,29 +48,85 @@ REAL_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # propia web hace internamente a su API. Esa llamada sí lleva las cookies de
 # sesión, cabeceras y token que su sistema anti-bot espera.
 
+def accept_cookies_if_present(page):
+    """
+    Muchos sitios (Wallapop incluido) no lanzan sus llamadas a la API hasta
+    que el banner de consentimiento de cookies se resuelve. Sin esto, un
+    navegador headless se queda esperando una petición que nunca llega.
+    Probamos varios textos/selectores típicos, sin fallar si no aparece.
+    """
+    selectors = [
+        "text=Aceptar todo",
+        "text=Aceptar todas",
+        "text=Aceptar",
+        "text=Accept all",
+        "text=Accept",
+        "#onetrust-accept-btn-handler",
+        "button[data-testid='cookie-accept-all']",
+        "button[id*='accept']",
+    ]
+    for sel in selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=2000):
+                btn.click(timeout=2000)
+                page.wait_for_timeout(500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def search_wallapop(context, keyword):
-    """Carga la página de búsqueda real y captura la respuesta JSON de la API."""
+    """
+    Carga la página de búsqueda real, acepta cookies si hace falta, y captura
+    la respuesta JSON que la propia web pide a su API. Si no encontramos la
+    llamada esperada, volcamos diagnóstico (URLs vistas + captura de pantalla)
+    para poder ver qué está pasando de verdad en vez de adivinar.
+    """
     items = []
     page = context.new_page()
+    seen_responses = []
+
+    def record_response(response):
+        seen_responses.append((response.status, response.url))
+
+    page.on("response", record_response)
+
     search_url = (
         "https://es.wallapop.com/app/search?"
         f"keywords={keyword.replace(' ', '+')}"
         f"&latitude={LATITUDE}&longitude={LONGITUDE}"
         "&filters_source=search_box&order_by=newest"
     )
-    try:
-        with page.expect_response(
-            lambda r: "api.wallapop.com" in r.url and "search" in r.url,
-            timeout=20000,
-        ) as resp_info:
-            page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
 
-        response = resp_info.value
-        if response.ok:
-            data = response.json()
+    try:
+        page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
+        accept_cookies_if_present(page)
+
+        # Damos margen a que la SPA dispare su llamada tras cargar/aceptar cookies
+        target_response = None
+        try:
+            target_response = page.wait_for_event(
+                "response",
+                lambda r: "wallapop.com" in r.url and "search" in r.url.lower(),
+                timeout=15000,
+            )
+        except Exception:
+            pass
+
+        if target_response and target_response.ok:
+            data = target_response.json()
             items = data.get("search_objects", []) or data.get("objects", [])
         else:
-            print(f"[ERROR] Estado de la respuesta para '{keyword}': {response.status}")
+            print(f"[ERROR] No se capturó respuesta de búsqueda válida para '{keyword}'.")
+            print(f"[DEBUG] {len(seen_responses)} peticiones vistas. Últimas 15:")
+            for status, url in seen_responses[-15:]:
+                print(f"    {status}  {url}")
+            if DEBUG:
+                safe_name = keyword.replace(' ', '_')
+                page.screenshot(path=f"debug_{safe_name}.png", full_page=True)
+                print(f"[DEBUG] Captura guardada en debug_{safe_name}.png")
     except Exception as e:
         print(f"[ERROR] Fallo buscando '{keyword}': {e}")
     finally:
